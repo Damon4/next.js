@@ -53,13 +53,23 @@ impl OutputAsset for SingleItemCssChunkSourceMapAsset {
 impl Asset for SingleItemCssChunkSourceMapAsset {
     #[turbo_tasks::function]
     async fn content(&self) -> Result<Vc<AssetContent>> {
-        let content = self.chunk.generate_source_map();
-        if content.await?.is_content() {
-            Ok(AssetContent::file(content))
-        } else {
-            Ok(AssetContent::file(
-                FileContent::Content(File::from(SourceMap::empty_rope())).cell(),
-            ))
+        let content_vc = self.chunk.generate_source_map();
+        let content = content_vc.await?;
+
+        if let Some(content_rope) = content.as_content() {
+            if let Some(unwrapped) = SourceMap::flatten_index_map(content_rope.content())? {
+                return Ok(AssetContent::file(
+                    FileContent::Content(File::from(unwrapped)).cell(),
+                ));
+            }
+
+            return Ok(AssetContent::file(
+                FileContent::Content(File::from(content_rope.content().clone())).cell(),
+            ));
         }
+
+        Ok(AssetContent::file(
+            FileContent::Content(File::from(SourceMap::empty_rope())).cell(),
+        ))
     }
 }

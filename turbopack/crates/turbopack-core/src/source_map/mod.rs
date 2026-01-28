@@ -500,6 +500,20 @@ impl SourceMap {
         let map = Box::pin(decoded_map_with_resolved_sources(&self.map, origin)).await?;
         Ok(Self::new_decoded(map.0))
     }
+
+    /// If the given sourcemap is an index map, return a flattened regular sourcemap rope.
+    /// This helps tools that don't fully support sectioned maps.
+    pub fn flatten_index_map(map: &Rope) -> Result<Option<Rope>> {
+        let Ok(decoded) = DecodedMap::from_reader(map.read()) else {
+            return Ok(None);
+        };
+
+        let DecodedMap::Index(index) = decoded else {
+            return Ok(None);
+        };
+
+        Ok(Some(SourceMap::new_regular(index.flatten()?).to_rope()?))
+    }
 }
 
 #[turbo_tasks::function]
