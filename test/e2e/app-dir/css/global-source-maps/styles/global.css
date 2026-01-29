@@ -1,0 +1,9 @@
+:root {
+  --primary: #123456;
+}
+
+.container {
+  color: var(--primary);
+  padding: 8px;
+  background-color: #00ff00;
+}

@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Result, bail};
 use lightningcss::{
@@ -123,6 +126,11 @@ async fn stylesheet_to_css(
         } else {
             srcmap.add_sources(ss.sources.clone());
             srcmap.set_source_content(0, code)?;
+        }
+
+        if enable_srcmap {
+            let source_name = ss.sources.first().map(String::as_str).unwrap_or("");
+            enhance_css_source_map(srcmap, source_name, code, &result.code);
         }
     }
 
@@ -681,6 +689,230 @@ fn generate_css_source_map(source_map: &parcel_sourcemap::SourceMap) -> Result<R
     let mut result = vec![];
     map.to_writer(&mut result)?;
     Ok(Rope::from(result))
+}
+
+#[derive(Debug, Clone)]
+struct DeclarationPos {
+    name: String,
+    line: u32,
+    column: u32,
+}
+
+fn enhance_css_source_map(
+    source_map: &mut parcel_sourcemap::SourceMap,
+    source_name: &str,
+    original: &str,
+    generated: &str,
+) {
+    let source_index = match find_source_index(source_map, source_name, original) {
+        Some(index) => index,
+        None => return,
+    };
+
+    let original_text = source_map
+        .get_source_content(source_index)
+        .unwrap_or(original);
+
+    let original_decls = collect_declarations(original_text);
+    let generated_decls = collect_declarations(generated);
+
+    if original_decls.is_empty() || generated_decls.is_empty() {
+        return;
+    }
+
+    let mut by_name: HashMap<String, VecDeque<DeclarationPos>> = HashMap::new();
+    for original_decl in original_decls {
+        by_name
+            .entry(original_decl.name.clone())
+            .or_default()
+            .push_back(original_decl);
+    }
+
+    for generated_decl in generated_decls {
+        let orig = by_name
+            .get_mut(&generated_decl.name)
+            .and_then(|queue| queue.pop_front());
+
+        let Some(orig) = orig else {
+            continue;
+        };
+
+        source_map.add_mapping(
+            generated_decl.line,
+            generated_decl.column,
+            Some(parcel_sourcemap::OriginalLocation {
+                original_line: orig.line,
+                original_column: orig.column,
+                source: source_index,
+                name: None,
+            }),
+        );
+    }
+}
+
+fn find_source_index(
+    source_map: &mut parcel_sourcemap::SourceMap,
+    source_name: &str,
+    original_hint: &str,
+) -> Option<u32> {
+    let sources = source_map.get_sources();
+    if sources.is_empty() || source_name.is_empty() {
+        return None;
+    }
+
+    if let Some((idx, _)) = sources
+        .iter()
+        .enumerate()
+        .find(|(_, src)| src.as_str() == source_name)
+    {
+        return Some(idx as u32);
+    }
+
+    let file_name = source_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(source_name);
+
+    if let Some((idx, _)) = sources
+        .iter()
+        .enumerate()
+        .find(|(_, src)| src.as_str().ends_with(file_name))
+    {
+        return Some(idx as u32);
+    }
+
+    let selector_hint = original_hint
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('.') || line.starts_with('#'))
+        .map(str::to_string);
+
+    if let Some(selector_hint) = selector_hint {
+        for (idx, content) in source_map.get_sources_content().iter().enumerate() {
+            if content.contains(&selector_hint) {
+                return Some(idx as u32);
+            }
+        }
+    }
+
+    if sources.len() == 1 {
+        return Some(0);
+    }
+
+    None
+}
+
+fn collect_declarations(code: &str) -> Vec<DeclarationPos> {
+    let mut decls = Vec::new();
+    let mut line: u32 = 0;
+    let mut column: u32 = 0;
+    let mut depth: i32 = 0;
+    let mut in_string: Option<char> = None;
+    let mut in_comment = false;
+    let mut expect_decl_start = false;
+
+    let chars: Vec<char> = code.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if in_comment {
+            if c == '*' && next == Some('/') {
+                in_comment = false;
+                i += 2;
+                column += 2;
+                continue;
+            }
+        } else if in_string.is_some() {
+            if Some(c) == in_string {
+                in_string = None;
+            }
+        } else if c == '/' && next == Some('*') {
+            in_comment = true;
+            i += 2;
+            column += 2;
+            continue;
+        } else if c == '"' || c == '\'' {
+            in_string = Some(c);
+        } else if c == '{' {
+            depth += 1;
+            expect_decl_start = depth > 0;
+        } else if c == '}' {
+            depth -= 1;
+            expect_decl_start = depth > 0;
+        } else if depth > 0 {
+            if c == ';' {
+                expect_decl_start = true;
+            } else if expect_decl_start {
+                if c.is_whitespace() {
+                    // skip
+                } else if c == '@' {
+                    expect_decl_start = false;
+                } else if is_ident_start(c, next) {
+                    let start_line = line;
+                    let start_col = column;
+                    let (name, consumed) = read_ident(&chars, i);
+                    let mut j = i + consumed;
+                    while let Some(ch) = chars.get(j) {
+                        if !ch.is_whitespace() || *ch == '\n' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if chars.get(j) == Some(&':') {
+                        decls.push(DeclarationPos {
+                            name,
+                            line: start_line,
+                            column: start_col,
+                        });
+                        expect_decl_start = false;
+                    }
+                }
+            }
+        }
+
+        if c == '\n' {
+            line += 1;
+            column = 0;
+        } else {
+            column += 1;
+        }
+        i += 1;
+    }
+
+    decls
+}
+
+fn is_ident_start(c: char, next: Option<char>) -> bool {
+    if c.is_ascii_alphabetic() || c == '_' {
+        return true;
+    }
+    if c == '-' {
+        return matches!(next, Some(n) if n.is_ascii_alphanumeric() || n == '-' || n == '_');
+    }
+    false
+}
+
+fn read_ident(chars: &[char], start: usize) -> (String, usize) {
+    let mut i = start;
+    let mut name = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            name.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            name.push(c);
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    (name, i - start)
 }
 
 #[turbo_tasks::value]
